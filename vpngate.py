@@ -7,7 +7,7 @@ VPN Gate SSTP 节点检测流水线
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
-  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?proxyip=host:port
+  4. 并发调用已部署的 Cloudflare Worker:  GET {WORKER}/check?sstp=vpn:vpn@host:port
      (单节点 HTTP 成功 != 节点可用; 以 Worker 返回 JSON 的 success 字段为准)
   5. 保留 success=true 的节点, 按国家分组, 生成 public/data.json + public/index.html
   6. 网页端 (GitHub Pages) 读取 data.json 展示
@@ -50,10 +50,12 @@ VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
-# 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://freesub.pinemuyi.workers.dev/check?sstp=vpn:vpn@")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
+# 已部署的 Cloudflare Worker 检测接口 (GET /check?sstp=vpn:vpn@host:port)
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://check.helei.kdns.fr/check?sstp=vpn:vpn@")
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "8")))    # 默认保守并发, 避免触发限流
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
+CHECK_RETRIES = max(0, int(os.environ.get("CHECK_RETRIES", "2")))      # 额外重试次数 (总尝试=1+重试)
+RETRY_BACKOFF_BASE = float(os.environ.get("CHECK_RETRY_BACKOFF", "0.5"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -307,10 +309,32 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
+def build_worker_url(worker_base, host, port):
+    """按当前 Worker 契约拼接 URL: CHECK_WORKER + urlencode(host:port)。"""
+    base = (worker_base or "").strip()
+    if not base:
+        raise ValueError("CHECK_WORKER 不能为空")
+    target = quote(f"{host}:{port}", safe="")
+    if "{target}" in base:
+        return base.replace("{target}", target)
+    return f"{base}{target}"
+
+
+def trim_text(text, limit=240):
+    value = (text or "").replace("\r", " ").replace("\n", " ")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "...(truncated)"
+
+
+def is_retryable_status(status_code):
+    return status_code in (408, 425, 429, 500, 502, 503, 504)
+
+
 def check_one(node, session):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    url = build_worker_url(WORKER_CHECK_URL, node["host"], node["port"])
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -318,47 +342,64 @@ def check_one(node, session):
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
-    try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+    attempts = CHECK_RETRIES + 1
+    for attempt in range(attempts):
+        try:
+            r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+            if r.status_code != 200:
+                detail = f"HTTP {r.status_code}, body={trim_text(r.text)}"
+                out["error"] = f"HTTP {r.status_code}"
+                out["error_detail"] = detail
+                out["worker_error"] = True
+                if attempt < CHECK_RETRIES and is_retryable_status(r.status_code):
+                    time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                return out
+            j = r.json()
+            ok = bool(j.get("success"))
+            out["success"] = ok
+            out["status"] = "success" if ok else "failed"
+            out["latency_ms"] = j.get("responseTime")
+            out["colo"] = j.get("colo")
+            out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
+            # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
+            exit_info = j.get("exit") or {}
+            if exit_info:
+                asn = exit_info.get("asn") or {}
+                org = asn.get("org") or asn.get("name") or ""
+                out["exit"] = {
+                    "ip": exit_info.get("ip"),
+                    "country": exit_info.get("country"),
+                    "country_code": exit_info.get("country_code"),
+                    "city": exit_info.get("city"),
+                    "continent": exit_info.get("continent"),
+                    "asn": asn.get("asn"),
+                    "org": org,
+                    "type": asn.get("type"),
+                    "is_datacenter": exit_info.get("is_datacenter"),
+                }
+                out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
+            else:
+                out["residential"] = classify_network(out["host"], None, None)
+            return out
+        except requests.RequestException as exc:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["error_detail"] = f"{type(exc).__name__}: {trim_text(str(exc))}"
+            out["worker_error"] = True
+            if attempt < CHECK_RETRIES:
+                time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+                continue
+            return out
+        except Exception as exc:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["error_detail"] = f"{type(exc).__name__}: {trim_text(str(exc))}"
             out["worker_error"] = True
             return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {
-                "ip": exit_info.get("ip"),
-                "country": exit_info.get("country"),
-                "country_code": exit_info.get("country_code"),
-                "city": exit_info.get("city"),
-                "continent": exit_info.get("continent"),
-                "asn": asn.get("asn"),
-                "org": org,
-                "type": asn.get("type"),
-                "is_datacenter": exit_info.get("is_datacenter"),
-            }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
-    except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        out["worker_error"] = True
-        return out
+    return out
 
 
 def check_all(nodes, session):
-    """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
+    """并发检测。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
         futures = [pool.submit(check_one, n, session) for n in nodes]
@@ -666,7 +707,7 @@ def main():
     log("VPN GATE", f"去重后: {len(uniq)}")
 
     # 3) 并发检测
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s, 重试 {CHECK_RETRIES})")
     t0 = time.time()
     results = check_all(uniq, session)
     elapsed = time.time() - t0
@@ -678,6 +719,13 @@ def main():
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+    if worker_errors:
+        samples = []
+        for item in worker_errors[:5]:
+            endpoint = f"{item.get('host')}:{item.get('port')}"
+            detail = item.get("error_detail") or item.get("error") or "unknown worker error"
+            samples.append(f"{endpoint} => {detail}")
+        log("CLOUDFLARE WORKER", "Worker 异常样例: " + " | ".join(samples))
 
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
     if uniq and not success and len(worker_errors) == len(uniq):
